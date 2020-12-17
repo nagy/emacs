@@ -34,6 +34,7 @@ struct window;
 #include <gtk/gtk.h>
 #ifndef HAVE_PGTK
 #include <X11/Xlib.h>
+#include <GL/glx.h>
 #include "xterm.h"
 #else
 #include "pgtkterm.h"
@@ -62,6 +63,19 @@ struct xwidget
 
   /* A title used for button labels, for instance.  */
   Lisp_Object title;
+
+  /* Init function used by GLArea widget.  */
+  Lisp_Object init_func;
+
+  /* Render function used by GLArea widget.  */
+  Lisp_Object render_func;
+
+  /* Input callbacks used by GLArea widget.  */
+  Lisp_Object cursor_pos_cb;
+  Lisp_Object mouse_button_cb;
+
+  /* Private data for GLArea widget */
+  Lisp_Object private_data;
 
   /* Vector of currently executing scripts with callbacks.  */
   Lisp_Object script_callbacks;
@@ -115,6 +129,7 @@ struct xwidget_view
   enum glyph_row_area area;
 
 #if defined (USE_GTK)
+  GLXContext glcontext;
 #ifndef HAVE_PGTK
   Display *dpy;
   Window wdesc;
@@ -180,6 +195,7 @@ struct xwidget_view
 
 #define XG_XWIDGET "emacs_xwidget"
 #define XG_XWIDGET_VIEW "emacs_xwidget_view"
+#define XG_GL_CONTEXT "emacs_gl_context"
 
 #ifdef HAVE_XWIDGETS
 void syms_of_xwidget (void);

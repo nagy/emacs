@@ -31,12 +31,14 @@ along with GNU Emacs.  If not, see <https://www.gnu.org/licenses/>.  */
 #include "sysstdio.h"
 #include "termhooks.h"
 #include "window.h"
+#include "buffer.h"
 #include "process.h"
 
 /* Include xwidget bottom end headers.  */
 #ifdef USE_GTK
 #include <webkit2/webkit2.h>
 #include <JavaScriptCore/JavaScript.h>
+#include <GL/glx.h>
 #include <cairo.h>
 #ifndef HAVE_PGTK
 #include <cairo-xlib.h>
@@ -286,6 +288,7 @@ If BUFFER is a string and no such buffer exists, create it.
 TYPE is a symbol which can take one of the following values:
 
 - webkit
+- glarea
 
 RELATED is nil, or an xwidget.  When constructing a WebKit widget, it
 will share the same settings and internal subprocess as RELATED.
@@ -303,7 +306,7 @@ fails.  */)
   CHECK_FIXNAT (width);
   CHECK_FIXNAT (height);
 
-  if (!EQ (type, Qwebkit))
+  if (!(EQ (type, Qwebkit) || EQ(type, Qglarea)))
     error ("Bad xwidget type");
 
   Frequire (Qxwidget, Qnil, Qnil);
@@ -326,20 +329,30 @@ fails.  */)
 
   Fputhash (make_fixnum (xw->xwidget_id), val, id_to_xwidget_map);
 
+  if (EQ (xw->type, Qglarea))
+    {
+      xw->init_func = Qnil;
+      xw->render_func = Qnil;
+      xw->cursor_pos_cb = Qnil;
+      xw->mouse_button_cb = Qnil;
+      xw->private_data = Qnil;
+
+      if (!NILP (arguments)) {
+        xw->init_func = plist_get(arguments, QCinit);
+        xw->render_func = plist_get(arguments, QCrender);
+        xw->cursor_pos_cb = plist_get(arguments, QCcursor_pos);
+        xw->mouse_button_cb = plist_get(arguments, QCmouse_button);
+        xw->private_data = plist_get(arguments, QCprivate);
+      }
+    }
+
 #ifdef USE_GTK
   xw->widgetwindow_osr = NULL;
   xw->widget_osr = NULL;
   xw->hit_result = 0;
-  if (EQ (xw->type, Qwebkit))
+  if (EQ (xw->type, Qwebkit) || EQ(xw->type, Qglarea))
     {
       block_input ();
-      WebKitSettings *settings;
-      WebKitWebContext *webkit_context = webkit_web_context_get_default ();
-
-# if WEBKIT_CHECK_VERSION (2, 26, 0)
-      if (!webkit_web_context_get_sandbox_enabled (webkit_context))
-	webkit_web_context_set_sandbox_enabled (webkit_context, TRUE);
-# endif
 
       xw->widgetwindow_osr = gtk_offscreen_window_new ();
       gtk_window_resize (GTK_WINDOW (xw->widgetwindow_osr), xw->width,
@@ -348,6 +361,13 @@ fails.  */)
 
       if (EQ (xw->type, Qwebkit))
         {
+          WebKitSettings *settings;
+          WebKitWebContext *webkit_context = webkit_web_context_get_default ();
+
+# if WEBKIT_CHECK_VERSION (2, 26, 0)
+          if (!webkit_web_context_get_sandbox_enabled (webkit_context))
+	    webkit_web_context_set_sandbox_enabled (webkit_context, TRUE);
+# endif
 	  WebKitWebView *related_view;
 
 	  if (NILP (related)
@@ -380,6 +400,9 @@ fails.  */)
 	  g_object_set (G_OBJECT (settings), "enable-developer-extras", TRUE, NULL);
 	  g_object_set (G_OBJECT (settings), "enable-javascript",
 		        (gboolean) (!xwidget_webkit_disable_javascript), NULL);
+	} else if (EQ (xw->type, Qglarea))
+	{
+          xw->widget_osr = gtk_gl_area_new ();
 	}
 
       gtk_widget_set_size_request (GTK_WIDGET (xw->widget_osr), xw->width,
@@ -390,7 +413,11 @@ fails.  */)
         {
           gtk_container_add (GTK_CONTAINER (xw->widgetwindow_osr),
                              GTK_WIDGET (WEBKIT_WEB_VIEW (xw->widget_osr)));
-        }
+        } else if (EQ (xw->type, Qglarea))
+	{
+          gtk_container_add (GTK_CONTAINER (xw->widgetwindow_osr),
+                             GTK_WIDGET (GTK_GL_AREA (xw->widget_osr)));
+	}
       else
         {
           gtk_container_add (GTK_CONTAINER (xw->widgetwindow_osr),
@@ -2173,6 +2200,40 @@ xv_do_draw (struct xwidget_view *xw, struct xwidget *w)
       return;
     }
 
+  if (EQ (w->type, Qglarea))
+    {
+      GdkWindow* xwin = gtk_widget_get_window (w->widgetwindow_osr);
+      /* GdkWindow* xwin_widget = gtk_widget_get_window (xw->widget); */
+      GLXContext glcontext = xw->glcontext;
+      if (! glcontext)
+        {
+          return;
+        }
+
+      struct buffer *buf = XBUFFER (w->buffer), *old = current_buffer;
+
+      set_buffer_internal (buf);
+
+      if (glXMakeCurrent (GDK_WINDOW_XDISPLAY (xwin), GDK_WINDOW_XID (xwin), glcontext))
+        {
+          if (!NILP (w->init_func))
+            {
+              call3 (w->init_func, make_fixed_natnum (w->width), make_fixed_natnum (w->height), w->private_data);
+              w->init_func = Qnil;
+            }
+
+          if (!NILP (w->render_func))
+            call1 (w->render_func, w->private_data);
+
+          glXSwapBuffers (GDK_WINDOW_XDISPLAY (xwin), GDK_WINDOW_XID (xwin));
+        }
+
+      set_buffer_internal (old);
+
+      return;
+    }
+
+
   block_input ();
   wnd = GTK_OFFSCREEN_WINDOW (w->widgetwindow_osr);
   surface = gtk_offscreen_window_get_surface (wnd);
@@ -2735,6 +2796,35 @@ xwidget_init_view (struct xwidget *xww,
   xv->just_resized = false;
   xv->last_crossing_window = NULL;
   xv->passive_grab = NULL;
+
+  if (EQ (xww->type, Qglarea))
+    {
+      /* Create GL context. */
+      GdkWindow* xwin = gtk_widget_get_window (xww->widgetwindow_osr);
+
+      printf("first\n");
+
+      GLint attr_list[] = {GLX_DOUBLEBUFFER,
+			   GLX_RGBA,
+			   GLX_DEPTH_SIZE, 16,
+			   GLX_RED_SIZE,   8,
+			   GLX_GREEN_SIZE, 8,
+			   GLX_BLUE_SIZE,  8,
+			   None};
+      XVisualInfo * visualinfo = glXChooseVisual (GDK_WINDOW_XDISPLAY (xwin),
+                                                  gdk_screen_get_number (gdk_window_get_screen (xwin)),
+                                                  attr_list);
+      printf("second\n");
+      GLXContext glcontext = glXCreateContext (GDK_WINDOW_XDISPLAY (xwin),
+                                               visualinfo,
+                                               NULL,
+                                               TRUE);
+      printf("third\n");
+      xfree (visualinfo);
+      xv->glcontext = glcontext;
+    }
+
+
 #elif defined HAVE_PGTK
   xv->dpyinfo = FRAME_DISPLAY_INFO (s->f);
   xv->widget = gtk_drawing_area_new ();
@@ -2789,32 +2879,10 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
   /* Do initialization here in the display loop because there is no
      other time to know things like window placement etc.  Do not
      create a new view if we have found one that is usable.  */
-#ifdef USE_GTK
   if (!xv)
     xv = xwidget_init_view (xww, s, x, y);
 
   xv->just_resized = false;
-#elif defined NS_IMPL_COCOA
-  if (!xv)
-    {
-      /* Enforce 1 to 1, model and view for macOS Cocoa webkit2.  */
-      if (xww->xv)
-        {
-          if (xwidget_hidden (xww->xv))
-            {
-              Lisp_Object xvl;
-              XSETXWIDGET_VIEW (xvl, xww->xv);
-              Fdelete_xwidget_view (xvl);
-            }
-          else
-            {
-              message ("You can't share an xwidget (webkit2) among windows.");
-              return;
-            }
-        }
-      xv = xwidget_init_view (xww, s, x, y);
-    }
-#endif
 
   xv->area = s->area;
 
@@ -2839,13 +2907,10 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
   bool moved = (xv->x + xv->clip_left != x + clip_left
 		|| xv->y + xv->clip_top != y + clip_top);
 
-#ifdef HAVE_X_WINDOWS
   bool wdesc_was_none = xv->wdesc == None;
-#endif
   xv->x = x;
   xv->y = y;
 
-#ifdef HAVE_X_WINDOWS
   block_input ();
   if (xv->wdesc == None)
     {
@@ -2868,69 +2933,18 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
 				 clip_bottom - clip_top, 0,
 				 CopyFromParent, CopyFromParent,
 				 CopyFromParent, CWEventMask, &a);
-#ifdef HAVE_XINPUT2
-      XIEventMask mask;
-      ptrdiff_t l = XIMaskLen (XI_LASTEVENT);
-      unsigned char *m;
-
-      if (FRAME_DISPLAY_INFO (s->f)->supports_xi2)
-	{
-	  mask.mask = m = alloca (l);
-	  memset (m, 0, l);
-	  mask.mask_len = l;
-	  mask.deviceid = XIAllMasterDevices;
-
-	  XISetMask (m, XI_Motion);
-	  XISetMask (m, XI_ButtonPress);
-	  XISetMask (m, XI_ButtonRelease);
-	  XISetMask (m, XI_Enter);
-	  XISetMask (m, XI_Leave);
-#ifdef HAVE_XINPUT2_4
-	  if (FRAME_DISPLAY_INFO (s->f)->xi2_version >= 4)
-	    {
-	      XISetMask (m, XI_GesturePinchBegin);
-	      XISetMask (m, XI_GesturePinchUpdate);
-	      XISetMask (m, XI_GesturePinchEnd);
-	    }
-#endif
-	  XISelectEvents (xv->dpy, xv->wdesc, &mask, 1);
-	}
-#endif
-      XLowerWindow (xv->dpy, xv->wdesc);
-      XDefineCursor (xv->dpy, xv->wdesc, xv->cursor);
-      xv->cr_surface = cairo_xlib_surface_create (xv->dpy,
-						  xv->wdesc,
-						  FRAME_DISPLAY_INFO (s->f)->visual,
-						  clip_right - clip_left,
-						  clip_bottom - clip_top);
-      xv->cr_context = cairo_create (xv->cr_surface);
-      Fputhash (make_fixnum (xv->wdesc), xvw, x_window_to_xwv_map);
 
       moved = false;
     }
-#endif
-#ifdef HAVE_PGTK
-  block_input ();
-#endif
 
   /* Has it moved?  */
   if (moved)
     {
-#ifdef HAVE_X_WINDOWS
       XMoveResizeWindow (xv->dpy, xv->wdesc, x + clip_left, y + clip_top,
 			 clip_right - clip_left, clip_bottom - clip_top);
       XFlush (xv->dpy);
       cairo_xlib_surface_set_size (xv->cr_surface, clip_right - clip_left,
 				   clip_bottom - clip_top);
-#elif defined HAVE_PGTK
-      gtk_widget_set_size_request (xv->widget, clip_right - clip_left,
-				   clip_bottom - clip_top);
-      gtk_fixed_move (GTK_FIXED (FRAME_GTK_WIDGET (xv->frame)),
-		      xv->widget, x + clip_left, y + clip_top);
-      gtk_widget_queue_allocate (xv->widget);
-#elif defined NS_IMPL_COCOA
-      nsxwidget_move_view (xv, x + clip_left, y + clip_top);
-#endif
     }
 
   /* Clip the widget window if some parts happen to be outside
@@ -2938,43 +2952,10 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
      covers the entire frame.  Clipping might have changed even if we
      haven't actually moved; try to figure out when we need to reclip
      for real.  */
-#ifndef HAVE_PGTK
   if (xv->clip_right != clip_right
       || xv->clip_bottom != clip_bottom
       || xv->clip_top != clip_top || xv->clip_left != clip_left)
-#endif
     {
-#ifdef USE_GTK
-#ifdef HAVE_X_WINDOWS
-      if (!wdesc_was_none && !moved)
-	{
-	  if (clip_right - clip_left <= 0
-	      || clip_bottom - clip_top <= 0)
-	    {
-	      XUnmapWindow (xv->dpy, xv->wdesc);
-	      xv->hidden = true;
-	    }
-	  else
-	    {
-	      XResizeWindow (xv->dpy, xv->wdesc, clip_right - clip_left,
-			     clip_bottom - clip_top);
-	    }
-	  XFlush (xv->dpy);
-	  cairo_xlib_surface_set_size (xv->cr_surface, clip_right - clip_left,
-				       clip_bottom - clip_top);
-	}
-#else
-      gtk_widget_set_size_request (xv->widget, clip_right - clip_left,
-				   clip_bottom - clip_top);
-      gtk_fixed_move (GTK_FIXED (FRAME_GTK_WIDGET (xv->frame)),
-		      xv->widget, x + clip_left, y + clip_top);
-      gtk_widget_queue_allocate (xv->widget);
-#endif
-#elif defined NS_IMPL_COCOA
-      nsxwidget_resize_view (xv, clip_right - clip_left,
-                             clip_bottom - clip_top);
-      nsxwidget_move_widget_in_view (xv, -clip_left, -clip_top);
-#endif
 
       xv->clip_right = clip_right;
       xv->clip_bottom = clip_bottom;
@@ -2991,32 +2972,17 @@ x_draw_xwidget_glyph_string (struct glyph_string *s)
     {
       if (!xwidget_hidden (xv))
 	{
-#ifdef USE_GTK
 	  gtk_widget_queue_draw (xww->widget_osr);
-#elif defined NS_IMPL_COCOA
-	  nsxwidget_set_needsdisplay (xv);
-#endif
 	}
     }
-#ifdef HAVE_X_WINDOWS
   else
     {
       XSetWindowBackground (xv->dpy, xv->wdesc,
 			    FRAME_BACKGROUND_PIXEL (s->f));
     }
-#endif
 
-#if defined HAVE_XINPUT2 || defined HAVE_PGTK
-  if (!NILP (xww->buffer))
-    {
-      record_osr_embedder (xv);
-      synthesize_focus_in_event (xww->widget_osr);
-    }
-#endif
 
-#ifdef USE_GTK
   unblock_input ();
-#endif
 }
 
 #define CHECK_WEBKIT_WIDGET(xw)				\
@@ -3923,6 +3889,7 @@ syms_of_xwidget (void)
   defsubr (&Sxwidget_view_lookup);
   defsubr (&Sxwidget_query_on_exit_flag);
   defsubr (&Sset_xwidget_query_on_exit_flag);
+  // defsubr (&Sxwidget_queue_redraw); // TODO maybe not needed
 
   defsubr (&Sxwidget_webkit_uri);
   defsubr (&Sxwidget_webkit_title);
@@ -3931,6 +3898,16 @@ syms_of_xwidget (void)
   defsubr (&Sxwidget_webkit_zoom);
   defsubr (&Sxwidget_webkit_execute_script);
   DEFSYM (Qwebkit, "webkit");
+
+  //defsubr (&Sxwidget_glarea_make_current);
+  DEFSYM (Qglarea, "glarea");
+  DEFSYM (Qpress, "press");
+  DEFSYM (Qrelease, "release");
+  DEFSYM (QCinit, ":init");
+  DEFSYM (QCrender, ":render");
+  DEFSYM (QCcursor_pos, ":cursor-pos");
+  DEFSYM (QCmouse_button, ":mouse-button");
+  DEFSYM (QCprivate, ":private");
 
   defsubr (&Sxwidget_size_request);
   defsubr (&Sdelete_xwidget_view);
